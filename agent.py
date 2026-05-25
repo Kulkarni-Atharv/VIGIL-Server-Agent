@@ -18,11 +18,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SERVER_URL         = os.getenv("SERVER_URL", "http://127.0.0.1:8000")
-JETSON_ID          = os.getenv("JETSON_ID", "jetson-01")
-API_KEY            = os.getenv("API_KEY", "vigil-secret-key-change-me")
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
+SERVER_URL          = os.getenv("SERVER_URL")
+JETSON_ID           = os.getenv("JETSON_ID")
+API_KEY             = os.getenv("API_KEY")
+HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
 MOCK_JETSON_METRICS = os.getenv("MOCK_JETSON_METRICS", "false").lower() == "true"
+
+for _var in ("SERVER_URL", "JETSON_ID", "API_KEY"):
+    if not os.getenv(_var):
+        raise SystemExit(f"ERROR: '{_var}' is not set — add it to your .env file")
 
 logging.basicConfig(
     level=logging.INFO,
