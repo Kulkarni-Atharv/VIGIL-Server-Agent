@@ -59,10 +59,12 @@ def parse_tegrastats_line(line: str) -> Tuple[Optional[float], Optional[float]]:
     gpu_match = re.search(r"GR3D_FREQ\s+(\d+)%", line)
     gpu = float(gpu_match.group(1)) if gpu_match else None
 
-    # Prefer dedicated GPU sensor; fall back to CPU die temperature
-    temp_match = re.search(r"GPU@([\d.]+)C", line)
-    if not temp_match:
-        temp_match = re.search(r"CPU@([\d.]+)C", line)
+    # Try gpu sensor → tj (junction, hottest point) → cpu — all case-insensitive
+    temp_match = (
+        re.search(r"gpu@([\d.]+)C", line, re.IGNORECASE) or
+        re.search(r"tj@([\d.]+)C",  line, re.IGNORECASE) or
+        re.search(r"cpu@([\d.]+)C", line, re.IGNORECASE)
+    )
     temp = float(temp_match.group(1)) if temp_match else None
 
     return gpu, temp
