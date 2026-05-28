@@ -4,3 +4,7 @@ python-dotenv>=1.0.1
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.6
 pydantic>=2.10.0
+# NOTE: On Jetson, OpenCV is pre-installed by JetPack — do NOT pip install opencv-python
+# as it will conflict with the hardware-accelerated system build.
+# On a dev PC (no JetPack), uncomment the line below:
+# opencv-python>=4.8.0
