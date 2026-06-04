@@ -13,6 +13,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+# TLS verification for outbound connections (currently unused here — kept for
+# symmetry with agent.py so all three files share the same env var surface).
+_ssl_raw         = os.getenv("SERVER_SSL_VERIFY", "true")
+SERVER_SSL_VERIFY = (
+    False if _ssl_raw.lower() == "false"
+    else _ssl_raw if _ssl_raw.lower() not in ("true", "1")
+    else True
+)
+
 from shared_state import stream_mgr
 
 load_dotenv()
@@ -37,8 +46,9 @@ class Command(BaseModel):
 
 
 @app.post("/api/v1/command")
-async def receive_command(cmd: Command, x_api_key: str = Header(...)):
-    if x_api_key != API_KEY:
+async def receive_command(cmd: Command,
+                          x_api_key: Optional[str] = Header(default=None)):
+    if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     logger.info(f"Command received: {cmd.command} | camera={cmd.camera_id}")

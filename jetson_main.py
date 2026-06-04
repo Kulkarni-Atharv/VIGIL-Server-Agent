@@ -26,6 +26,14 @@ HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL", "2"))
 MOCK_JETSON_METRICS = os.getenv("MOCK_JETSON_METRICS", "false").lower() == "true"
 CMD_RECEIVER_PORT   = int(os.getenv("CMD_RECEIVER_PORT", "8001"))
 
+# TLS verification for the Central Server connection (mirrors central_server setting).
+_ssl_raw         = os.getenv("SERVER_SSL_VERIFY", "true")
+SERVER_SSL_VERIFY = (
+    False if _ssl_raw.lower() == "false"
+    else _ssl_raw if _ssl_raw.lower() not in ("true", "1")
+    else True
+)
+
 for _var in ("SERVER_URL", "JETSON_ID", "API_KEY"):
     if not os.getenv(_var):
         raise SystemExit(f"ERROR: '{_var}' is not set — add it to your .env file")
@@ -59,8 +67,12 @@ def run_heartbeat_loop():
     from shared_state import stream_mgr
 
     def get_local_ip() -> str:
+        override = os.getenv("JETSON_IP", "").strip()
+        if override:
+            return override
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(2)
                 s.connect(("8.8.8.8", 80))
                 return s.getsockname()[0]
         except Exception:
@@ -131,7 +143,8 @@ def run_heartbeat_loop():
                 "rtsp_error_count":      stream_mgr.get_total_errors(),
             }
 
-            resp   = requests.post(url, json=payload, headers=headers, timeout=5)
+            resp   = requests.post(url, json=payload, headers=headers,
+                                   timeout=5, verify=SERVER_SSL_VERIFY)
             resp.raise_for_status()
             result = resp.json()
             logger.info(

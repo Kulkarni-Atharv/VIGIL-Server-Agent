@@ -24,6 +24,17 @@ API_KEY             = os.getenv("API_KEY")
 HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
 MOCK_JETSON_METRICS = os.getenv("MOCK_JETSON_METRICS", "false").lower() == "true"
 
+# TLS verification for the Central Server connection.
+# true (default) → verify against system CA bundle
+# false          → skip verification (dev/self-signed only, never use in production)
+# /path/to/ca.pem → verify against a specific CA certificate file
+_ssl_raw         = os.getenv("SERVER_SSL_VERIFY", "true")
+SERVER_SSL_VERIFY = (
+    False if _ssl_raw.lower() == "false"
+    else _ssl_raw if _ssl_raw.lower() not in ("true", "1")
+    else True
+)
+
 for _var in ("SERVER_URL", "JETSON_ID", "API_KEY"):
     if not os.getenv(_var):
         raise SystemExit(f"ERROR: '{_var}' is not set — add it to your .env file")
@@ -38,9 +49,19 @@ logger = logging.getLogger(__name__)
 # ── Network helpers ───────────────────────────────────────────────────────────
 
 def get_local_ip() -> str:
-    """Return the primary outbound IP address of this machine."""
+    """Return the IP address the Central Server should use to reach this Jetson.
+
+    Resolution order:
+    1. JETSON_IP env var — use this in air-gapped networks where 8.8.8.8 is unreachable.
+    2. UDP trick against 8.8.8.8 — works on networks with an internet route.
+    3. Fallback 127.0.0.1 — last resort; commands will fail but heartbeats still reach server.
+    """
+    override = os.getenv("JETSON_IP", "").strip()
+    if override:
+        return override
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2)
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
     except Exception:
@@ -112,6 +133,13 @@ def get_mock_jetson_metrics() -> Tuple[Optional[float], Optional[float]]:
 # ── Metric collection ─────────────────────────────────────────────────────────
 
 def collect_metrics() -> dict:
+    """
+    Stage 1 metric collection — system health only.
+    Camera metrics (assigned_camera_count, detection_fps, rtsp_error_count)
+    are sent as Pydantic defaults (0 / None / 0) because this module has no
+    access to CameraStreamManager.  Use jetson_main.py for Stage 2 operation
+    which includes live camera metrics in the heartbeat payload.
+    """
     cpu  = psutil.cpu_percent(interval=1)          # blocking 1-second sample
     ram  = psutil.virtual_memory().percent
     disk = psutil.disk_usage("/").percent
@@ -130,6 +158,7 @@ def collect_metrics() -> dict:
         "disk_percent": disk,
         "gpu_percent":  gpu,
         "temperature":  temperature,
+        # Stage 2 fields omitted here — TelemetryPayload defaults handle them
     }
 
 
@@ -139,7 +168,8 @@ def send_heartbeat(payload: dict) -> bool:
     url     = f"{SERVER_URL}/api/v1/heartbeat"
     headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=5)
+        resp = requests.post(url, json=payload, headers=headers,
+                             timeout=5, verify=SERVER_SSL_VERIFY)
         resp.raise_for_status()
         result = resp.json()
         logger.info(
