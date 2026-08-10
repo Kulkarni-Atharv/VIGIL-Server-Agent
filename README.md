@@ -43,6 +43,10 @@ Both backends report per-camera health as `STARTING` / `UP` / `DOWN`, based on *
 
 Switch backends with `STREAM_BACKEND=opencv` (default) or `STREAM_BACKEND=deepstream` in `.env`. The central server's contract is identical either way — it only ever sees `camera_health` / `active_camera_ids` in the heartbeat, not which backend produced them.
 
+### DeepStream inference
+
+With `STREAM_BACKEND=deepstream`, set `DS_INFER_CONFIG_PATH` in `.env` to the same `nvinfer` config file your existing standalone DeepStream pipeline already uses (model engine, labels, etc. all live inside that file — nothing to duplicate). Leave it blank to run ingestion + health-checking only, with no detection, as a safe first step. Optional `DS_TRACKER_CONFIG_PATH` and `DS_ENABLE_OSD`; output sink via `DS_SINK_TYPE` (`fakesink` default — correct for a headless server agent, detections are still extracted and logged even with nothing rendered). See `deepstream_stream_manager.py`'s docstring for the full picture — this has not been validated on real DeepStream hardware yet, only stub-tested for interface correctness.
+
 ---
 
 ## Requirements

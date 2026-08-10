@@ -24,14 +24,26 @@ just produce a frame" has to be observed a different way:
      with OpenCV, a slow/throttled AI stage (e.g. 0.2 fps) can never look
      like a dead camera.
 
-── What this module owns vs. what it doesn't ─────────────────────────────────
-This manager owns ingestion (per-camera source bins → nvstreammux) and
-health tracking only — the same scope as camera_stream_manager.py's OpenCV
-loop. It deliberately does NOT build your inference branch (nvinfer /
-tracker / OSD / sink), since that's specific to your existing DeepStream
-app and model config. Pass `on_source_added(streammux, pad, source_id)` to
-the constructor to attach your existing inference branch the first time a
-source is linked — see the __main__ example at the bottom of this file.
+── Inference branch — nvinfer / nvtracker / nvdsosd / sink ───────────────────
+Built ONCE, right after nvstreammux, not per-camera — inference runs on the
+whole batch (all cameras together), which is the point of batching in the
+first place. Wired up automatically if DS_INFER_CONFIG_PATH is set in
+.env, pointing at your existing nvinfer config file (the same one your
+current standalone DeepStream pipeline already uses). Optional nvtracker
+(DS_TRACKER_CONFIG_PATH) and nvdsosd (DS_ENABLE_OSD) stages, and a
+configurable sink (DS_SINK_TYPE: fakesink/display/rtsp/file).
+
+If DS_INFER_CONFIG_PATH is unset, no inference branch is built at all —
+the pipeline still runs and reports camera health (ingestion + health is
+useful on its own for testing), it just doesn't detect anything. This is
+the safe default until you're ready to point it at a real model config.
+
+Detections are extracted via a probe after nvinfer (see
+_detection_probe) and currently just logged, throttled per source — this
+is the extension point for wiring detections into an alerting/event
+pipeline later (e.g. POSTing to the central server's /api/v1/events).
+Nothing here decides what "happens" with a detection beyond logging it,
+since that's a product decision this module doesn't own.
 
 ── Connection budget ──────────────────────────────────────────────────────────
 Exactly 1 RTSP connection per camera, same as OpenCV — each camera gets its
@@ -82,6 +94,29 @@ MUX_HEIGHT      = int(os.getenv("DS_MUX_HEIGHT", "1080"))
 MUX_BATCH_SIZE  = int(os.getenv("DS_MUX_BATCH_SIZE", "12"))
 MUX_BATCH_TIMEOUT_USEC = int(os.getenv("DS_MUX_BATCH_TIMEOUT_USEC", "40000"))
 
+# ── Inference branch config — point these at your existing model files ───────
+# Path to the nvinfer config .txt your current standalone DeepStream pipeline
+# already uses (model engine path, labels file, etc. all live inside that
+# file, same as any standard DeepStream app). Unset = no inference branch;
+# the pipeline still ingests + health-checks cameras, just doesn't detect.
+DS_INFER_CONFIG_PATH   = os.getenv("DS_INFER_CONFIG_PATH", "").strip()
+# Optional — path to an nvtracker config (e.g. NvDCF/IOU tracker config file).
+DS_TRACKER_CONFIG_PATH = os.getenv("DS_TRACKER_CONFIG_PATH", "").strip()
+# Optional — nvdsosd draws bounding boxes; only useful if you're also using
+# a visual sink (display/rtsp/file). No effect on detection/health logic.
+DS_ENABLE_OSD          = os.getenv("DS_ENABLE_OSD", "false").strip().lower() == "true"
+# fakesink (default, headless — detections are still extracted via the probe
+# even though nothing is rendered) | display (nveglglessink, needs a screen) |
+# file (mp4 via nvv4l2h264enc, DS_SINK_FILE_PATH) | rtsp (basic RTSP re-stream
+# out, DS_SINK_RTSP_PORT).
+DS_SINK_TYPE           = os.getenv("DS_SINK_TYPE", "fakesink").strip().lower()
+DS_SINK_FILE_PATH      = os.getenv("DS_SINK_FILE_PATH", "/tmp/vigil_deepstream_out.mp4")
+DS_SINK_RTSP_PORT      = int(os.getenv("DS_SINK_RTSP_PORT", "8554"))
+# Minimum seconds between detection log lines PER SOURCE — inference runs on
+# every batch (many times a second); this just throttles logging, not
+# detection itself.
+DS_DETECTION_LOG_INTERVAL_SECONDS = float(os.getenv("DS_DETECTION_LOG_INTERVAL_SECONDS", "5"))
+
 
 class _SourceState:
     """Health bookkeeping for one camera's source bin."""
@@ -114,11 +149,12 @@ class DeepStreamStreamManager:
 
     def __init__(self, on_source_added: Optional[Callable] = None):
         """
-        on_source_added(pipeline, streammux, source_id): called the first
-        time a source's pad is linked into streammux, so you can attach your
-        existing inference branch (nvinfer/tracker/OSD/sink) here. Left
-        unset, the pipeline still runs and reports health — it just has no
-        inference branch, which is fine for testing ingestion/health alone.
+        on_source_added(pipeline, streammux, source_id): OPTIONAL — called
+        the first time a source's pad is linked into streammux. Most
+        DeepStream apps don't need this: inference is built ONCE, shared
+        across all sources (see _build_inference_branch), not per-camera.
+        Use this hook only for genuinely per-source needs (e.g. a
+        per-camera output sink) beyond the shared inference branch below.
         """
         self._lock = threading.Lock()
         self._sources: Dict[str, _SourceState] = {}
@@ -126,6 +162,7 @@ class DeepStreamStreamManager:
         self._on_source_added = on_source_added
         self._loop_thread: Optional[threading.Thread] = None
         self._glib_loop = None
+        self._last_detection_log: Dict[int, float] = {}   # source_id -> monotonic time
 
         if not _DEEPSTREAM_AVAILABLE:
             self._stub_health: Dict[str, str] = {}
@@ -147,6 +184,11 @@ class DeepStreamStreamManager:
         mux_src_pad = self.streammux.get_static_pad("src")
         mux_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._health_probe, None)
 
+        # Inference branch — built once, shared across every camera. No-op
+        # (pipeline still runs, still reports health) if DS_INFER_CONFIG_PATH
+        # isn't set. See module docstring.
+        self._build_inference_branch()
+
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
@@ -157,6 +199,199 @@ class DeepStreamStreamManager:
             target=self._glib_loop.run, name="deepstream-glib-loop", daemon=True
         )
         self._loop_thread.start()
+        if DS_INFER_CONFIG_PATH:
+            logger.info(f"DeepStream inference branch active — config: {DS_INFER_CONFIG_PATH}")
+        else:
+            logger.warning(
+                "DS_INFER_CONFIG_PATH not set — pipeline will ingest and "
+                "health-check cameras but will NOT run detection. Set it in "
+                ".env once you're ready to point this at your real model."
+            )
+
+    # ── Inference branch — nvinfer / nvtracker / nvdsosd / sink, built once ──
+
+    def _build_inference_branch(self) -> None:
+        if not DS_INFER_CONFIG_PATH:
+            return
+        if not os.path.isfile(DS_INFER_CONFIG_PATH):
+            logger.error(
+                f"DS_INFER_CONFIG_PATH='{DS_INFER_CONFIG_PATH}' does not exist "
+                f"— skipping inference branch, pipeline will only ingest/health-check"
+            )
+            return
+
+        pgie = Gst.ElementFactory.make("nvinfer", "vigil-pgie")
+        pgie.set_property("config-file-path", DS_INFER_CONFIG_PATH)
+        self.pipeline.add(pgie)
+        self.streammux.link(pgie)
+        last = pgie
+
+        if DS_TRACKER_CONFIG_PATH:
+            if os.path.isfile(DS_TRACKER_CONFIG_PATH):
+                tracker = Gst.ElementFactory.make("nvtracker", "vigil-tracker")
+                self._apply_tracker_config(tracker, DS_TRACKER_CONFIG_PATH)
+                self.pipeline.add(tracker)
+                last.link(tracker)
+                last = tracker
+            else:
+                logger.error(
+                    f"DS_TRACKER_CONFIG_PATH='{DS_TRACKER_CONFIG_PATH}' does not "
+                    f"exist — continuing without a tracker"
+                )
+
+        # Detection probe — reads NvDsObjectMeta off every batch right after
+        # inference (and tracking, if configured). This is the extension
+        # point for turning detections into alerts/events later.
+        last.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._detection_probe, None
+        )
+
+        convert = Gst.ElementFactory.make("nvvideoconvert", "vigil-convert")
+        self.pipeline.add(convert)
+        last.link(convert)
+        last = convert
+
+        if DS_ENABLE_OSD:
+            osd = Gst.ElementFactory.make("nvdsosd", "vigil-osd")
+            self.pipeline.add(osd)
+            last.link(osd)
+            last = osd
+
+        sink = self._build_sink()
+        self.pipeline.add(sink)
+        last.link(sink)
+
+    def _apply_tracker_config(self, tracker, config_path: str) -> None:
+        """nvtracker takes its settings from a key=value config file, not a
+        single config-file-path property — parse the [tracker] section the
+        same way NVIDIA's own reference apps do."""
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read(config_path)
+        if "tracker" not in cfg:
+            logger.error(f"No [tracker] section in {config_path} — using nvtracker defaults")
+            return
+        section = cfg["tracker"]
+        prop_map = {
+            "tracker-width":            ("tracker-width", int),
+            "tracker-height":           ("tracker-height", int),
+            "gpu-id":                   ("gpu-id", int),
+            "ll-lib-file":              ("ll-lib-file", str),
+            "ll-config-file":           ("ll-config-file", str),
+        }
+        for key, (prop, cast) in prop_map.items():
+            if key in section:
+                try:
+                    tracker.set_property(prop, cast(section[key]))
+                except Exception:
+                    logger.exception(f"Failed to set nvtracker property {prop}")
+
+    def _build_sink(self):
+        """Build the tail of the pipeline per DS_SINK_TYPE. fakesink
+        (default) is the right choice for a headless server agent — you
+        still get detections via the probe above even though nothing is
+        rendered or written anywhere."""
+        if DS_SINK_TYPE == "fakesink":
+            sink = Gst.ElementFactory.make("fakesink", "vigil-sink")
+            sink.set_property("sync", False)
+            return sink
+
+        if DS_SINK_TYPE == "display":
+            sink = Gst.ElementFactory.make("nveglglessink", "vigil-sink")
+            sink.set_property("sync", False)
+            return sink
+
+        if DS_SINK_TYPE == "file":
+            bin_ = Gst.Bin.new("vigil-file-sink-bin")
+            enc     = Gst.ElementFactory.make("nvv4l2h264enc", "vigil-enc")
+            parse   = Gst.ElementFactory.make("h264parse", "vigil-parse")
+            mux     = Gst.ElementFactory.make("qtmux", "vigil-mux")
+            filesink = Gst.ElementFactory.make("filesink", "vigil-filesink")
+            filesink.set_property("location", DS_SINK_FILE_PATH)
+            for el in (enc, parse, mux, filesink):
+                bin_.add(el)
+            enc.link(parse)
+            parse.link(mux)
+            mux.link(filesink)
+            ghost = Gst.GhostPad.new("sink", enc.get_static_pad("sink"))
+            bin_.add_pad(ghost)
+            return bin_
+
+        if DS_SINK_TYPE == "rtsp":
+            # Basic RTP/UDP H264 output, viewable with e.g.
+            # `ffplay udp://<jetson-ip>:<DS_SINK_RTSP_PORT>` — NOT a full
+            # mountable RTSP server (that needs GstRtspServer, more setup
+            # than fits here). Good enough to visually spot-check detections
+            # on the network; swap for your own sink if you need a real
+            # RTSP mount point.
+            bin_ = Gst.Bin.new("vigil-rtsp-sink-bin")
+            enc  = Gst.ElementFactory.make("nvv4l2h264enc", "vigil-enc")
+            pay  = Gst.ElementFactory.make("rtph264pay", "vigil-pay")
+            sink = Gst.ElementFactory.make("udpsink", "vigil-udpsink")
+            sink.set_property("port", DS_SINK_RTSP_PORT)
+            sink.set_property("sync", False)
+            for el in (enc, pay, sink):
+                bin_.add(el)
+            enc.link(pay)
+            pay.link(sink)
+            ghost = Gst.GhostPad.new("sink", enc.get_static_pad("sink"))
+            bin_.add_pad(ghost)
+            return bin_
+
+        logger.error(f"Unknown DS_SINK_TYPE='{DS_SINK_TYPE}' — falling back to fakesink")
+        sink = Gst.ElementFactory.make("fakesink", "vigil-sink")
+        sink.set_property("sync", False)
+        return sink
+
+    def _detection_probe(self, _pad, info, _user_data):
+        """
+        Extracts detections per batched buffer and logs them, throttled per
+        source. This is the extension point for wiring detections into an
+        alerting/event pipeline (e.g. POSTing to the central server) —
+        nothing here decides what should happen with a detection beyond
+        logging it.
+        """
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+
+        now = time.monotonic()
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame is not None:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            source_id  = frame_meta.source_id
+
+            objects = []
+            l_obj = frame_meta.obj_meta_list
+            while l_obj is not None:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                objects.append((obj_meta.obj_label, round(obj_meta.confidence, 2)))
+                l_obj = l_obj.next
+
+            if objects:
+                last_log = self._last_detection_log.get(source_id, 0)
+                if now - last_log >= DS_DETECTION_LOG_INTERVAL_SECONDS:
+                    camera_id = self._camera_id_for_source(source_id)
+                    logger.info(
+                        f"[{camera_id or source_id}] Detected: "
+                        + ", ".join(f"{label}({conf})" for label, conf in objects)
+                    )
+                    self._last_detection_log[source_id] = now
+
+            l_frame = l_frame.next
+
+        return Gst.PadProbeReturn.OK
+
+    def _camera_id_for_source(self, source_id: int) -> Optional[str]:
+        with self._lock:
+            for cid, state in self._sources.items():
+                if state.pad_index == source_id:
+                    return cid
+        return None
         logger.info(
             f"DeepStream pipeline started (batch-size={MUX_BATCH_SIZE}, "
             f"{MUX_WIDTH}x{MUX_HEIGHT})"
@@ -411,22 +646,14 @@ class DeepStreamStreamManager:
 
 
 if __name__ == "__main__":
-    # Minimal smoke test — attach a trivial inference branch (fakesink only)
-    # so the pipeline is runnable standalone without a real model configured.
-    # Replace on_source_added with your real nvinfer/tracker/OSD/sink chain.
+    # Minimal smoke test. The inference branch (nvinfer/tracker/OSD/sink) is
+    # built automatically from DS_INFER_CONFIG_PATH etc. in .env — nothing
+    # extra to wire up here. Without DS_INFER_CONFIG_PATH set, this just
+    # exercises ingestion + health tracking (no detection), which is a fine
+    # first smoke test before pointing it at a real model.
     logging.basicConfig(level=logging.INFO)
 
-    def _attach_fakesink(pipeline, streammux, source_id):
-        convert = Gst.ElementFactory.make("nvvideoconvert", f"conv-{source_id}")
-        sink    = Gst.ElementFactory.make("fakesink", f"sink-{source_id}")
-        pipeline.add(convert)
-        pipeline.add(sink)
-        convert.link(sink)
-        streammux.get_static_pad("src").link(convert.get_static_pad("sink"))
-        convert.sync_state_with_parent()
-        sink.sync_state_with_parent()
-
-    mgr = DeepStreamStreamManager(on_source_added=_attach_fakesink)
+    mgr = DeepStreamStreamManager()
     mgr.start_stream("cam-test-1", "rtsp://127.0.0.1:8554/test")
     time.sleep(60)
     print(mgr.get_camera_health())
