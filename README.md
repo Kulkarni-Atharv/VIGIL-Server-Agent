@@ -33,8 +33,15 @@ Both threads share a single `CameraStreamManager` instance via `shared_state.py`
 | `jetson_main.py` | Entry point — starts command receiver thread + heartbeat loop |
 | `agent.py` | Standalone Stage 1 heartbeat agent (metrics only, no camera management) |
 | `command_receiver.py` | FastAPI server on port 8001 — handles `ASSIGN_CAMERA` / `REMOVE_CAMERA` |
-| `camera_stream_manager.py` | Thread-safe manager for RTSP stream workers (OpenCV) |
-| `shared_state.py` | Singleton `CameraStreamManager` shared across both threads |
+| `camera_stream_manager.py` | Thread-safe manager for RTSP stream workers (OpenCV backend, default) |
+| `deepstream_stream_manager.py` | Same interface, GStreamer/DeepStream backend — see its docstring |
+| `shared_state.py` | Singleton stream manager shared across both threads — backend picked via `STREAM_BACKEND` |
+
+### Camera health, independent of AI inference rate
+
+Both backends report per-camera health as `STARTING` / `UP` / `DOWN`, based on **frame staleness** (time since the last successful frame was decoded) — never on your AI model's inference FPS. This matters if your pipeline intentionally runs inference at a low rate (e.g. 0.2 fps): the camera still reports `UP` as long as raw frames keep arriving, regardless of how often the model actually looks at one. Tune `CAMERA_STALE_AFTER_SECONDS` / `CAMERA_FAIL_THRESHOLD` in `.env` to your actual frame-read cadence.
+
+Switch backends with `STREAM_BACKEND=opencv` (default) or `STREAM_BACKEND=deepstream` in `.env`. The central server's contract is identical either way — it only ever sees `camera_health` / `active_camera_ids` in the heartbeat, not which backend produced them.
 
 ---
 

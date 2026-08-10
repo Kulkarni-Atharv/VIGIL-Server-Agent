@@ -129,6 +129,8 @@ def run_heartbeat_loop():
             else:
                 gpu, temp = get_tegrastats_metrics()
 
+            camera_health = stream_mgr.get_camera_health()
+
             payload = {
                 "jetson_id":             JETSON_ID,
                 "hostname":              socket.gethostname(),
@@ -139,20 +141,34 @@ def run_heartbeat_loop():
                 "gpu_percent":           gpu,
                 "temperature":           temp,
                 "assigned_camera_count": stream_mgr.get_camera_count(),
+                # Informational only — the server no longer uses these for
+                # DEGRADED/health decisions (see camera_health below instead).
                 "detection_fps":         stream_mgr.get_average_fps(),
                 "rtsp_error_count":      stream_mgr.get_total_errors(),
+                # The actual per-camera health signal: frame staleness, not FPS.
+                "camera_health":         camera_health,
+                # Lets the server reconcile stale connections if this Jetson
+                # was network-partitioned and the camera got reassigned elsewhere.
+                "active_camera_ids":     stream_mgr.get_active_camera_ids(),
             }
 
             resp   = requests.post(url, json=payload, headers=headers,
                                    timeout=5, verify=SERVER_SSL_VERIFY)
             resp.raise_for_status()
             result = resp.json()
+            down_count = sum(1 for s in camera_health.values() if s == "DOWN")
             logger.info(
                 f"Heartbeat OK | CPU:{cpu:.1f}% RAM:{ram:.1f}% "
                 f"GPU:{gpu} Temp:{temp}°C "
-                f"Cams:{stream_mgr.get_camera_count()} "
+                f"Cams:{stream_mgr.get_camera_count()} (Down:{down_count}) "
                 f"→ {result.get('load_status')} (score {result.get('load_score')})"
             )
+            for cid in result.get("stale_cameras_reclaimed", []):
+                logger.warning(
+                    f"Server reclaimed stale connection for camera {cid} "
+                    f"(no longer assigned to this Jetson) — stopping locally"
+                )
+                stream_mgr.stop_stream(cid)
 
         except requests.exceptions.ConnectionError:
             logger.warning(f"Cannot reach server at {SERVER_URL} — will retry")
